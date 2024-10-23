@@ -1,3 +1,10 @@
 # For available configuration options, see:
 #   https://github.com/standardrb/standard
 ruby_version: 3.0
+
+ignore:
+  - 'lib/action_dispatch/i18n_routing/patches/mapper.rb':
+    - Lint/UnderscorePrefixedVariableName
+  - 'lib/action_dispatch/i18n_routing/patches/route_set.rb':
+    - Lint/UnderscorePrefixedVariableName
+    - Layout/HashAlignment
