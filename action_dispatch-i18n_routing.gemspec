@@ -34,8 +34,8 @@ Gem::Specification.new do |spec|
   # Uncomment to register a new dependency of your gem
   # spec.add_dependency "example-gem", "~> 1.0"
 
-  spec.add_dependency "actionpack", ">= 6.1", "< 8.0"
-  spec.add_dependency "activesupport", ">= 6.1", "< 8.0"
+  spec.add_dependency "actionpack", ">= 6.1", "< 9.0"
+  spec.add_dependency "activesupport", ">= 6.1", "< 9.0"
   spec.add_dependency "dry-configurable", "~> 0.16"
 
   # For more information and examples about making a new gem, check out our
