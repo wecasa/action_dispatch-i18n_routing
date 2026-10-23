@@ -12,11 +12,11 @@ module ActionDispatch
           @localized = false
         end
 
-        # This method is based on +ActionDispatch::Routing::Mapper::Resources+ (rails v7.2.1.1)
+        # This method is based on +ActionDispatch::Routing::Mapper::Resources+ (rails v8.1.4)
         #
-        # Source: https://github.com/rails/rails/blob/a1f6a13f691e0929d40b7e1b1e0d31aa69778128/actionpack/lib/action_dispatch/routing/mapper.rb#L2007-L2032
+        # Source: https://github.com/rails/rails/blob/v8.1.4/actionpack/lib/action_dispatch/routing/mapper.rb#L2195-L2215
         #
-        def add_route(action, controller, options, _path, to, via, formatted, anchor, options_constraints)
+        def add_route(action, controller, as, options_action, _path, to, via, formatted, anchor, options_constraints, internal, options_mapping)
           return super unless @localized
 
           path = path_for_action(action, _path)
@@ -24,7 +24,7 @@ module ActionDispatch
 
           action = action.to_s
 
-          default_action = options.delete(:action) || @scope[:action]
+          default_action = options_action || @scope[:action]
 
           if /^[\w\-\/]+$/.match?(action)
             default_action ||= action.tr("-", "_") unless action.include?("/")
@@ -32,17 +32,13 @@ module ActionDispatch
             action = nil
           end
 
-          as = if !options.fetch(:as, true) # if it's set to nil or false
-            options.delete(:as)
-          else
-            name_for_action(options.delete(:as), action)
-          end
+          as = name_for_action(as, action) if as
 
-          path = ActionDispatch::Routing::Mapper::Mapping.normalize_path URI::DEFAULT_PARSER.escape(path), formatted
+          path = ActionDispatch::Routing::Mapper::Mapping.normalize_path URI::RFC2396_PARSER.escape(path), formatted
           ast = ActionDispatch::Journey::Parser.parse path
 
-          mapping = ActionDispatch::Routing::Mapper::Mapping.build(@scope, @set, ast, controller, default_action, to, via, formatted, options_constraints, anchor, options)
-          @set.add_localized_route(mapping, as, anchor, @scope, path, controller, default_action, to, via, formatted, options_constraints, options)
+          mapping = ActionDispatch::Routing::Mapper::Mapping.build(@scope, @set, ast, controller, default_action, to, via, formatted, options_constraints, anchor, internal, options_mapping)
+          @set.add_localized_route(mapping, as, anchor, @scope, path, controller, default_action, to, via, formatted, options_constraints, internal, options_mapping)
         end
 
         private

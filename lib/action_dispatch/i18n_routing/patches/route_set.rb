@@ -9,7 +9,7 @@ module ActionDispatch
       module RouteSet
         include ActionDispatch::Routing::Redirection
 
-        def add_localized_route(mapping, name, anchor, scope, path, controller, default_action, to, via, formatted, options_constraints, options)
+        def add_localized_route(mapping, name, anchor, scope, path, controller, default_action, to, via, formatted, options_constraints, internal, options)
           ActionDispatch::I18nRouting::Translator::RouteHelpers.add(name, named_routes)
 
           ActionDispatch::I18nRouting.config.available_locales_per_host.each do |host, available_locales|
@@ -37,7 +37,8 @@ module ActionDispatch
                 formatted,
                 via,
                 translated_options_constraints,
-                anchor
+                anchor,
+                internal
               )
               add_route(translated_mapping, translated_name)
             end
@@ -86,7 +87,7 @@ module ActionDispatch
           translated_options_constraints
         end
 
-        def translate_mapping(locale, route_set, translated_options, translated_path_ast, scope, controller, default_action, to, formatted, via, translated_options_constraints, anchor)
+        def translate_mapping(locale, route_set, translated_options, translated_path_ast, scope, controller, default_action, to, formatted, via, translated_options_constraints, anchor, internal)
           scope_params = {
             blocks:      (scope[:blocks] || []).dup,
             constraints: scope[:constraints] || {},
@@ -95,7 +96,7 @@ module ActionDispatch
             options:     scope[:options] ? scope[:options].merge(translated_options) : translated_options
           }
 
-          ActionDispatch::Routing::Mapper::Mapping.build scope_params, route_set, translated_path_ast, controller, default_action, to, via, formatted, translated_options_constraints, anchor, translated_options
+          ActionDispatch::Routing::Mapper::Mapping.build scope_params, route_set, translated_path_ast, controller, default_action, to, via, formatted, translated_options_constraints, anchor, internal, translated_options
         end
       end
     end
