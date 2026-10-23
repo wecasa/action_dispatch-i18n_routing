@@ -300,6 +300,36 @@ RSpec.describe ActionDispatch::I18nRouting::Patches::RouteSet do
         expect(recognize("http://x.ch/de-ch")).to include(locale: "de-CH")
       end
 
+      it "moves the slash of a root optional segment into it after the locale prefix" do
+        draw_localized { |app| get "(/:page)", to: app, as: :home }
+
+        expect(path_specs).to eq(["/(:page)(.:format)", "/fr-ch(/:page)(.:format)", "/de-ch(/:page)(.:format)"])
+      end
+
+      it "recognizes the bare locale prefix of a root path made of an optional segment" do
+        draw_localized { |app| get "(/:page)", to: app, as: :home }
+
+        expect(recognize("http://x.ch/de-ch")).to include(locale: "de-CH")
+        expect(recognize("http://x.ch/de-ch/")).to include(locale: "de-CH")
+        expect(recognize("http://x.ch/de-ch/2")).to include(locale: "de-CH", page: "2")
+        expect(recognize("http://x.fr/")).to include(locale: "fr-FR")
+        expect(recognize("http://x.fr/2")).to include(locale: "fr-FR", page: "2")
+        expect(url_helpers.home_path(locale: "fr-CH")).to eq("/fr-ch")
+        expect(url_helpers.home_path(locale: "fr-CH", page: 2)).to eq("/fr-ch/2")
+      end
+
+      it "moves the slash of a root optional segment written without it, or coming from a scope" do
+        draw_localized do |app|
+          get "(:page)", to: app, as: :home
+          scope("(:region)") { get "/", to: app, as: :region }
+        end
+
+        expect(path_spec(:home_de_ch)).to eq("/de-ch(/:page)(.:format)")
+        expect(path_spec(:region_de_ch)).to eq("/de-ch(/:region)(.:format)")
+        expect(path_spec(:region_fr_fr)).to eq("/(:region)(.:format)")
+        expect(recognize("http://x.ch/de-ch")).to include(locale: "de-CH")
+      end
+
       it "appends the required format of a root path to the bare locale prefix" do
         draw_localized { |app| get "/", to: app, as: :feed, format: true }
 
@@ -377,6 +407,31 @@ RSpec.describe ActionDispatch::I18nRouting::Patches::RouteSet do
       end
     end
 
+    context "with a route without controller" do
+      # A controller sharing its name with a path segment has a subtree of
+      # translations under that key.
+      before { I18n.backend.store_translations(:"fr-FR", routes: {controllers: {people: {edit: "modifier"}}}) }
+
+      it "translates its path with the global translations" do
+        draw_localized do |app|
+          get "people", to: app, as: :people
+          get "people/old", to: redirect("/people"), as: :old_people
+        end
+
+        expect(path_spec(:people_fr_fr)).to eq("/personnes(.:format)")
+        expect(path_spec(:old_people_fr_fr)).to eq("/personnes/old(.:format)")
+      end
+
+      it "looks its translations up under :routes only, not under a controller" do
+        allow(ActionDispatch::I18nRouting::Translator::PathSegment).to receive(:translate).and_call_original
+
+        draw_localized { |app| get "people", to: app, as: :people }
+
+        expect(ActionDispatch::I18nRouting::Translator::PathSegment)
+          .to have_received(:translate).with("people", anything, [:routes]).exactly(3).times
+      end
+    end
+
     describe "constraints, defaults and options" do
       it "applies segment constraints given in the route options" do
         draw_localized { |app| get "people/:id", to: app, as: :person, constraints: {id: /\d+/} }
@@ -389,6 +444,39 @@ RSpec.describe ActionDispatch::I18nRouting::Patches::RouteSet do
         draw_localized { get "people", to: "people#index", as: :people, constraints: {subdomain: "www"} }
 
         expect(named_route(:people_fr_fr).constraints).to eq(subdomain: "www", host: "x.fr")
+      end
+
+      it "applies a lambda given as route constraints, next to the host and locale" do
+        draw_localized do |app|
+          get "people", to: app, as: :people, constraints: ->(request) { request.query_string == "allowed" }
+        end
+
+        expect(recognize("http://x.fr/personnes?allowed")).to include(locale: "fr-FR")
+        expect(recognize("http://x.fr/personnes")).to be_nil
+        expect(recognize("http://x.fr/fr-ch/gens?allowed")).to be_nil
+        expect(named_route(:people_fr_ch).constraints).to eq(host: "x.ch")
+        expect(url_helpers.people_url(locale: "fr-CH")).to eq("http://x.ch/fr-ch/gens")
+      end
+
+      it "applies an object responding to matches? given as route constraints" do
+        constraint = Object.new
+        def constraint.matches?(request) = request.query_string == "allowed"
+
+        draw_localized { |app| get "people", to: app, as: :people, constraints: constraint }
+
+        expect(recognize("http://x.ch/de-ch/leute?allowed")).to include(locale: "de-CH")
+        expect(recognize("http://x.ch/de-ch/leute")).to be_nil
+      end
+
+      it "lets a callable given as route constraints replace the constraint blocks of a surrounding scope, like Rails" do
+        draw_localized do |app|
+          constraints(->(request) { request.query_string.include?("scope") }) do
+            get "people", to: app, as: :people, constraints: ->(request) { request.query_string.include?("route") }
+          end
+        end
+
+        expect(recognize("http://x.fr/personnes?route")).to include(locale: "fr-FR")
+        expect(recognize("http://x.fr/personnes?scope")).to be_nil
       end
 
       it "applies defaults given in the route options" do
@@ -484,21 +572,175 @@ RSpec.describe ActionDispatch::I18nRouting::Patches::RouteSet do
         expect(recognize("http://x.fr/personnes")).to include(locale: "fr-FR")
       end
 
+      it "leaves the routes Rails leaves unnamed in a resource unnamed" do
+        draw_localized { resources :people, only: %i[index create] }
+
+        expect(route_names).to eq(%w[people_fr_fr people_fr_ch people_de_ch] + [nil, nil, nil])
+      end
+
+      it "defines no people_path-like helper for unnamed routes" do
+        draw_localized do |app|
+          get "people/:id", to: app
+          get "people", to: app, as: nil
+          get "others", to: app, as: false
+        end
+
+        expect(route_set.named_routes.path_helpers_module.instance_methods).to be_empty
+        expect(route_set.named_routes.url_helpers_module.instance_methods).to be_empty
+      end
+
+      it "raises like Rails when an explicit name is already in use" do
+        expect do
+          draw_localized do |app|
+            get "people", to: app, as: :people
+            get "others", to: app, as: :people
+          end
+        end.to raise_error(ArgumentError, /\AInvalid route name, already in use: 'people_fr_fr'/)
+      end
+
+      it "raises like Rails when an explicit name is in use by a route drawn outside `localized`" do
+        app = endpoint
+
+        expect do
+          route_set.draw do
+            get "team", to: app, as: :people_de_ch
+            localized { get "people", to: app, as: :people }
+          end
+        end.to raise_error(ArgumentError, /\AInvalid route name, already in use: 'people_de_ch'/)
+      end
+
+      # The mapper tells whether the name comes from an `as:` option; here
+      # every name is declared explicit, whatever the mapper finds.
+      context "when the name is declared explicit" do
+        before do
+          allow(route_set).to receive(:add_localized_route).and_wrap_original do |method, *args, **options|
+            method.call(*args, **options.merge(explicit_name: true))
+          end
+        end
+
+        it "raises the error Rails raises for a name already in use" do
+          expect do
+            draw_localized do |app|
+              get "people", to: app, as: :people
+              post "people", to: app
+            end
+          end.to raise_error(ArgumentError, /\AInvalid route name, already in use: 'people_fr_fr'/)
+        end
+
+        it "adds the routes when their name is free" do
+          draw_localized { |app| get "people", to: app, as: :people }
+
+          expect(route_names).to eq(%w[people_fr_fr people_fr_ch people_de_ch])
+        end
+      end
+
       context "when hosts share a locale" do
         let(:locales_per_host) { {"a.fr" => [:fr], "b.ch" => [:de, :fr]} }
         let(:translations) { {fr: {people: "gens"}, de: {people: "leute"}} }
 
-        before { draw_localized { |app| get "people", to: app, as: :people } }
-
-        it "still adds a route for every host and locale" do
-          expect(path_specs).to eq(["/gens(.:format)", "/fr/gens(.:format)", "/de/leute(.:format)"])
-          expect(recognize("http://a.fr/gens")).to include(locale: "fr")
-          expect(recognize("http://b.ch/fr/gens")).to include(locale: "fr")
+        def draw_people
+          draw_localized { |app| get "people", to: app, as: :people }
         end
 
-        it "gives the shared localized name to the route of the first host" do
-          expect(path_spec(:people_fr)).to eq("/gens(.:format)")
-          expect(named_route(:people_fr).constraints).to eq(host: "a.fr")
+        it "raises an error naming the shared locale and its hosts" do
+          expect { draw_people }.to raise_error(
+            ActionDispatch::I18nRouting::Error,
+            "Locale :fr is configured for several hosts (a.fr, b.ch); each locale must belong to a single host, " \
+            'use region-specific locales such as :"fr-FR" and :"fr-CH"'
+          )
+        end
+
+        it "adds no route nor helper" do
+          expect { draw_people }.to raise_error(ActionDispatch::I18nRouting::Error)
+
+          expect(route_set.routes).to be_empty
+          expect(route_set.named_routes.path_helpers_module.instance_methods).to be_empty
+        end
+
+        context "with several shared locales" do
+          let(:locales_per_host) { {"a.fr" => [:fr, :de], "b.ch" => [:de, :fr], "c.it" => [:it]} }
+
+          it "names every shared locale and the hosts sharing them" do
+            expect { draw_people }.to raise_error(
+              ActionDispatch::I18nRouting::Error,
+              /\ALocales :fr, :de are configured for several hosts \(a\.fr, b\.ch\);/
+            )
+          end
+        end
+
+        # The routes below get implicit names: a second route for the locale
+        # would silently be left unnamed, no ArgumentError would reveal it.
+        context "when the hosts sharing it are not the first two" do
+          let(:locales_per_host) { {"a.fr" => [:fr], "b.de" => [:de], "c.ch" => [:it, :fr]} }
+
+          it "raises an error naming them" do
+            expect { draw_localized { resources :people, only: :index } }.to raise_error(
+              ActionDispatch::I18nRouting::Error,
+              /\ALocale :fr is configured for several hosts \(a\.fr, c\.ch\);/
+            )
+          end
+        end
+
+        context "when it is a Symbol for a host and a String for another" do
+          let(:locales_per_host) { {"a.fr" => [:fr], "b.ch" => [:de, "fr"]} }
+
+          it "raises an error naming it once" do
+            expect { draw_localized { resources :people, only: :index } }.to raise_error(
+              ActionDispatch::I18nRouting::Error,
+              /\ALocale :fr is configured for several hosts \(a\.fr, b\.ch\);/
+            )
+          end
+        end
+
+        # The route names, and so the hosts' routes, only differ by the
+        # underscored locale: people_fr_fr for all these spellings.
+        context "when it is spelled with another case or an underscore" do
+          let(:locales_per_host) { {"a.fr" => [:"fr-FR"], "b.be" => [:fr_FR], "c.lu" => [:"fr-fr"]} }
+          let(:translations) { {} }
+
+          it "raises an error naming every spelling" do
+            expect { draw_localized { resources :people, only: :index } }.to raise_error(
+              ActionDispatch::I18nRouting::Error,
+              /\ALocale :"fr-FR" \/ :fr_FR \/ :"fr-fr" is configured for several hosts \(a\.fr, b\.be, c\.lu\);/
+            )
+          end
+        end
+      end
+
+      context "when a host lists a locale more than once" do
+        let(:locales_per_host) { {"a.fr" => [:"fr-FR"], "b.ch" => [:"de-CH", :"fr-CH", :"de-CH"]} }
+
+        it "raises an error naming the locale and the host, for implicit and explicit names" do
+          message = 'Locale :"de-CH" is listed more than once for host b.ch'
+
+          expect { draw_localized { resources :people, only: :index } }
+            .to raise_error(ActionDispatch::I18nRouting::Error, message)
+          expect { draw_localized { |app| root to: app } }
+            .to raise_error(ActionDispatch::I18nRouting::Error, message)
+          expect(route_set.routes).to be_empty
+        end
+
+        context "when another host lists it too" do
+          let(:locales_per_host) { {"a.ch" => [:"de-CH"], "b.ch" => [:"fr-CH", :"de-CH", :"de-CH"]} }
+
+          it "names the host listing it more than once" do
+            expect { draw_localized { resources :people, only: :index } }.to raise_error(
+              ActionDispatch::I18nRouting::Error,
+              'Locale :"de-CH" is listed more than once for host b.ch'
+            )
+          end
+        end
+
+        context "with another spelling" do
+          let(:locales_per_host) { {"b.ch" => [:"de-CH", :"fr-CH", :de_ch]} }
+          let(:translations) { {} }
+
+          it "raises an error naming every spelling" do
+            expect { draw_localized { resources :people, only: :index } }.to raise_error(
+              ActionDispatch::I18nRouting::Error,
+              'Locale :"de-CH" / :de_ch is listed more than once for host b.ch'
+            )
+          end
         end
       end
     end
@@ -532,6 +774,14 @@ RSpec.describe ActionDispatch::I18nRouting::Patches::RouteSet do
 
       it "ignores names taken for other locales" do
         expect(route_set.send(:translate_name, :people, :"de-CH", [:people_fr_ch])).to eq("people_de_ch")
+      end
+
+      it "returns a taken localized name when the name is explicit" do
+        expect(route_set.send(:translate_name, :people, :"de-CH", [:people_de_ch], explicit_name: true)).to eq("people_de_ch")
+      end
+
+      it "returns nil for a blank explicit name" do
+        expect(route_set.send(:translate_name, nil, :"de-CH", [], explicit_name: true)).to be_nil
       end
     end
 
@@ -581,6 +831,38 @@ RSpec.describe ActionDispatch::I18nRouting::Patches::RouteSet do
 
         expect(constraints).to eq(id: /\d+/)
       end
+
+      it "returns only the locale and the host for callable constraints" do
+        constraints = route_set.send(:translate_options_constraints, ->(_request) { true }, :"fr-CH", "x.ch")
+
+        expect(constraints).to eq(locale: "fr-CH", host: "x.ch")
+      end
+    end
+
+    describe "#constraint_blocks" do
+      let(:scope_block) { ->(_request) { true } }
+
+      it "keeps the constraint blocks of the scope for Hash constraints" do
+        expect(route_set.send(:constraint_blocks, [scope_block], {id: /\d+/})).to eq([scope_block])
+        expect(route_set.send(:constraint_blocks, [scope_block], nil)).to eq([scope_block])
+        expect(route_set.send(:constraint_blocks, nil, {})).to eq([])
+      end
+
+      it "replaces them with callable constraints" do
+        constraint = ->(_request) { false }
+
+        expect(route_set.send(:constraint_blocks, [scope_block], constraint)).to eq([constraint])
+      end
+    end
+
+    describe "#translation_scope" do
+      it "looks the translations of a route up under its controller" do
+        expect(route_set.send(:translation_scope, "admin/people")).to eq([:routes, :controllers, "admin/people"])
+      end
+
+      it "looks the translations of a route without controller up under :routes" do
+        expect(route_set.send(:translation_scope, nil)).to eq([:routes])
+      end
     end
 
     describe "#translate_path" do
@@ -607,6 +889,13 @@ RSpec.describe ActionDispatch::I18nRouting::Patches::RouteSet do
       it "keeps a leading optional segment after the locale prefix, without doubling its slash" do
         expect(translate_path("(/:region)/people(.:format)", :"fr-FR", "x.fr")).to eq("(/:region)/personnes(.:format)")
         expect(translate_path("(/:region)/people(.:format)", :"de-CH", "x.ch")).to eq("/de-ch(/:region)/leute(.:format)")
+      end
+
+      # "/(:page)(.:format)" is what the mapper builds for `get "(/:page)"`.
+      it "moves the slash of a root optional segment into it after the locale prefix" do
+        expect(translate_path("/(:page)(.:format)", :"fr-FR", "x.fr")).to eq("/(:page)(.:format)")
+        expect(translate_path("/(:page)(.:format)", :"de-CH", "x.ch")).to eq("/de-ch(/:page)(.:format)")
+        expect(translate_path("/(:page)(/:sort)", :"de-CH", "x.ch")).to eq("/de-ch(/:page)(/:sort)")
       end
 
       it "does not modify the given path" do
