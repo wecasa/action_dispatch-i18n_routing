@@ -15,14 +15,13 @@ module ActionDispatch
         #   people_path -> people_de_path
         #   I18n.locale = :fr
         #   people_path -> people_fr_path
+        # Unnamed routes (nil, "" or false name) get no helper.
         def add(old_name, named_route_collection)
-          helper_list = named_route_collection.helper_names
+          return if old_name.blank?
 
           %w[path url].each do |suffix|
             helper_container = named_route_collection.send(:"#{suffix}_helpers_module")
             new_helper_name = :"#{old_name}_#{suffix}"
-
-            helper_list.push(new_helper_name) unless helper_list.include?(new_helper_name)
 
             helper_container.__send__(:define_method, new_helper_name) do |*args|
               # __send__(Translator.route_name_for(args, old_name, suffix, self), *args)
@@ -30,6 +29,12 @@ module ActionDispatch
               locale = (locale || I18n.locale).to_s.underscore
               __send__(:"#{old_name}_#{locale}_#{suffix}", *args)
             end
+
+            # Track the helper in the Set Rails keeps for its own named route
+            # helpers (@path_helpers / @url_helpers): helper_names (so it is not
+            # a controller action), route_defined? and clear! (so a redraw
+            # removes it) then treat it like any other named route helper.
+            named_route_collection.instance_variable_get(:"@#{suffix}_helpers") << new_helper_name
 
             next unless ENV.fetch("RAILS_ENV", nil) == "test"
 

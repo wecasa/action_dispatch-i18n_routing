@@ -550,11 +550,134 @@ RSpec.describe "Localized routing across hosts (integration)" do
   describe "hosts sharing a locale" do
     let(:locales_per_host) { {"example.fr" => [:"fr-FR"], "www.example.fr" => [:"fr-FR"]} }
 
-    it "serves the locale's translated routes on every host that lists it" do
-      ["example.fr", "www.example.fr"].each do |host|
-        expect(recognize("http://#{host}/personnes")).to include(controller: "people", action: "index", locale: "fr-FR")
-        expect(recognize("http://#{host}/personnes/3/commentaires"))
-          .to include(controller: "comments", action: "index", person_id: "3", locale: "fr-FR")
+    # Localized routes are named after their locale only: the route of the
+    # second host could be neither named nor generated, and the helpers would
+    # send its visitors to the first host.
+    it "refuses to draw localized routes, naming the shared locale and its hosts" do
+      expect { route_set }.to raise_error(
+        ActionDispatch::I18nRouting::Error,
+        /\ALocale :"fr-FR" is configured for several hosts \(example\.fr, www\.example\.fr\); each locale must belong to a single host/
+      )
+    end
+  end
+
+  # End-to-end checks of fixed bugs. Each example draws its own localized
+  # routes, so that a route that cannot be drawn only fails its own example.
+  describe "regressions" do
+    let(:route_set) { ActionDispatch::Routing::RouteSet.new }
+
+    def draw_localized(&routes)
+      route_set.draw { localized { instance_exec(&routes) } }
+    end
+
+    # Status and headers of the response to a GET request, for endpoints that
+    # do not answer 200 (redirects).
+    def response_head(url)
+      status, headers, = route_set.call(rack_env(url, "GET", {}))
+      [status, headers["location"]]
+    end
+
+    context "with a segment made of more than a word" do
+      before { I18n.backend.store_translations(:"fr-FR", routes: {page: "fiche"}) }
+
+      it "keeps the optional suffix of a translated word" do
+        draw_localized { get "page(s)", to: "pages#index", as: :pages }
+
+        expect(recognize("http://example.fr/fiche")).to include(controller: "pages", action: "index", locale: "fr-FR")
+        expect(recognize("http://example.fr/fiches")).to include(controller: "pages", action: "index", locale: "fr-FR")
+        expect(recognize("http://example.co.uk/pages")).to include(controller: "pages", action: "index", locale: "en-GB")
+        # Like Rails, generation keeps the optional part made of static text.
+        expect(helpers.pages_path(locale: "fr-FR")).to eq("/fiches")
+      end
+
+      it "keeps the closing parenthesis of an optional segment" do
+        draw_localized { get "people(/archive)", to: "people#index", as: :people }
+
+        expect(recognize("http://example.fr/personnes")).to include(controller: "people", action: "index", locale: "fr-FR")
+        expect(recognize("http://example.fr/personnes/archives")).to include(controller: "people", action: "index", locale: "fr-FR")
+        expect(recognize("http://example.ch/de-ch/leute")).to include(controller: "people", action: "index", locale: "de-CH")
+        expect(recognize("http://example.ch/de-ch/leute/archiv")).to include(controller: "people", action: "index", locale: "de-CH")
+        expect(helpers.people_path(locale: "de-CH")).to eq("/de-ch/leute/archiv")
+      end
+
+      it "keeps an optional scope, after the locale prefix" do
+        draw_localized do
+          scope "(/archive)" do
+            get "comments", to: "comments#index", as: :comments
+          end
+        end
+
+        expect(recognize("http://example.fr/commentaires")).to include(controller: "comments", action: "index", locale: "fr-FR")
+        expect(recognize("http://example.fr/archives/commentaires")).to include(controller: "comments", locale: "fr-FR")
+        expect(recognize("http://example.ch/de-ch/kommentare")).to include(controller: "comments", locale: "de-CH")
+        expect(recognize("http://example.ch/de-ch/archiv/kommentare")).to include(controller: "comments", locale: "de-CH")
+        expect(recognize("http://example.ch/archiv/de-ch/kommentare")).to be_nil
+        expect(helpers.comments_path(locale: "de-CH")).to eq("/de-ch/archiv/kommentare")
+      end
+
+      it "keeps the percent-encoded characters of an untranslated word" do
+        draw_localized { get "café", to: "pages#cafe", as: :cafe }
+
+        expect(recognize("http://example.fr/caf%C3%A9")).to include(controller: "pages", action: "cafe", locale: "fr-FR")
+        expect(recognize("http://example.ch/it-ch/caf%C3%A9")).to include(controller: "pages", action: "cafe", locale: "it-CH")
+        expect(recognize("http://example.fr/caf")).to be_nil
+        expect(helpers.cafe_path(locale: "fr-FR")).to eq("/caf%C3%A9")
+      end
+    end
+
+    context "with a segment that does not start with a translatable word" do
+      it "keeps a percent-encoded segment as written" do
+        draw_localized { get "über-uns", to: "pages#imprint", as: :imprint }
+
+        expect(recognize("http://example.fr/%C3%BCber-uns")).to include(controller: "pages", action: "imprint", locale: "fr-FR")
+        expect(recognize("http://example.ch/fr-ch/%C3%BCber-uns")).to include(controller: "pages", action: "imprint", locale: "fr-CH")
+        expect(helpers.imprint_path(locale: "de-CH")).to eq("/de-ch/%C3%BCber-uns")
+      end
+
+      it "keeps a segment starting with a symbol as written and translates the others" do
+        draw_localized { get "people/@me", to: "people#me", as: :me }
+
+        expect(recognize("http://example.fr/personnes/@me")).to include(controller: "people", action: "me", locale: "fr-FR")
+        expect(recognize("http://example.ch/de-ch/leute/@me")).to include(controller: "people", action: "me", locale: "de-CH")
+        expect(helpers.me_path(locale: "it-CH")).to eq("/it-ch/persone/@me")
+      end
+    end
+
+    context "with a key naming a group of translations" do
+      # The people controller has translations of its own: "people" is also
+      # the key of a group of translations under routes.controllers.
+      before { I18n.backend.store_translations(:"fr-FR", routes: {controllers: {people: {archive: "historique"}}}) }
+
+      it "translates the path of a redirect with the global translations" do
+        draw_localized { get "people/archive", to: redirect("/personnes") }
+
+        expect(response_head("http://example.fr/personnes/archives")).to eq([301, "http://example.fr/personnes"])
+        expect(response_head("http://example.ch/de-ch/leute/archiv")).to eq([301, "http://example.ch/personnes"])
+      end
+
+      it "translates the path of a Rack application with the global translations" do
+        export = shop_app
+        draw_localized { get "people/export", to: export, as: :people_export }
+
+        expect(recognize("http://example.fr/personnes/export")).to eq(script_name: "", path_info: "/personnes/export")
+        expect(helpers.people_export_path(locale: "fr-FR")).to eq("/personnes/export")
+      end
+
+      it "still translates the routes of the controller with its own translations" do
+        draw_localized do
+          get "people/archive", to: "people#archive", as: :people_archive
+          get "people/archive/old", to: redirect("/personnes/historique")
+        end
+
+        expect(recognize("http://example.fr/personnes/historique")).to include(controller: "people", action: "archive", locale: "fr-FR")
+        expect(response_head("http://example.fr/personnes/archives/old")).to eq([301, "http://example.fr/personnes/historique"])
+      end
+
+      it "leaves a segment naming a group of translations untranslated" do
+        draw_localized { get "controllers", to: "pages#controllers", as: :controllers_page }
+
+        expect(recognize("http://example.fr/controllers")).to include(controller: "pages", action: "controllers", locale: "fr-FR")
+        expect(helpers.controllers_page_path(locale: "fr-FR")).to eq("/controllers")
       end
     end
   end

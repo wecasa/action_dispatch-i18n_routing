@@ -195,6 +195,41 @@ RSpec.describe ActionDispatch::I18nRouting::Patches::Mapper do
         expect(named_paths).to include("plain" => "/plain(.:format)")
         expect(named_paths.keys).not_to include("plain_fr_fr")
       end
+
+      it "keeps localizing the routes drawn in the outer block after the inner block" do
+        draw do
+          localized do
+            localized { get "people", to: "people#index", as: :people }
+            get "people/feed", to: "people#feed", as: :feed
+          end
+        end
+
+        expect(named_paths).to include(
+          "feed_fr_fr" => "/personnes/feed(.:format)",
+          "feed_fr_ch" => "/fr-ch/gens/feed(.:format)",
+          "feed_de_ch" => "/de-ch/leute/feed(.:format)"
+        )
+        expect(named_paths.keys).not_to include("feed")
+        expect(recognize("http://example.fr/personnes/feed")).to include(action: "feed", locale: "fr-FR")
+        expect(recognize("http://anything.test/people/feed")).to be_nil
+      end
+
+      it "keeps localizing the outer block once an exception has escaped the inner block" do
+        boom = Class.new(StandardError)
+
+        draw do
+          localized do
+            begin
+              localized { raise boom }
+            rescue boom
+              # swallowed so the rest of the routes can be drawn
+            end
+            get "people/feed", to: "people#feed", as: :feed
+          end
+        end
+
+        expect(named_paths.keys).to contain_exactly("feed_fr_fr", "feed_fr_ch", "feed_de_ch")
+      end
     end
   end
 
@@ -581,6 +616,83 @@ RSpec.describe ActionDispatch::I18nRouting::Patches::Mapper do
       ])
       expect(recognize("http://example.fr/personnes/42")).to include(action: "show", id: "42")
     end
+
+    it "raises like Rails when a name given with `as:` is already in use" do
+      rails_message = nil
+      expect {
+        ActionDispatch::Routing::RouteSet.new.draw do
+          get "people/a", to: "people#a", as: :feed
+          get "people/b", to: "people#b", as: :feed
+        end
+      }.to raise_error(ArgumentError) { |error| rails_message = error.message }
+
+      expect {
+        draw do
+          localized do
+            get "people/a", to: "people#a", as: :feed
+            get "people/b", to: "people#b", as: :feed
+          end
+        end
+      }.to raise_error(ArgumentError, rails_message.sub("'feed'", "'feed_fr_fr'"))
+    end
+
+    it "raises like Rails when a String name given with `as:` is already in use" do
+      expect {
+        draw do
+          localized do
+            get "people/a", to: "people#a", as: "feed"
+            get "people/b", to: "people#b", as: "feed"
+          end
+        end
+      }.to raise_error(ArgumentError, /\AInvalid route name, already in use: 'feed_fr_fr'/)
+    end
+
+    it "raises when a name given with `as:` is already used by a route drawn outside `localized`" do
+      expect {
+        draw do
+          get "people/a", to: "people#a", as: :feed_fr_fr
+          localized { get "people/b", to: "people#b", as: :feed }
+        end
+      }.to raise_error(ArgumentError, /Invalid route name, already in use: 'feed_fr_fr'/)
+    end
+
+    it "raises like Rails when `root` is declared twice, `root` naming its route explicitly" do
+      expect { ActionDispatch::Routing::RouteSet.new.draw { 2.times { root to: "people#index" } } }
+        .to raise_error(ArgumentError, /already in use: 'root'/)
+      expect { draw { localized { 2.times { root to: "people#index" } } } }
+        .to raise_error(ArgumentError, /already in use: 'root_fr_fr'/)
+    end
+
+    it "leaves a route unnamed when the name derived from its path is already in use, as Rails does" do
+      draw do
+        localized do
+          get "people/feed", to: "people#feed"
+          get "people/feed", to: "people#legacy_feed"
+        end
+      end
+
+      expect(route_table).to eq([
+        ["people_feed_fr_fr", "GET", "/personnes/feed(.:format)"],
+        ["people_feed_fr_ch", "GET", "/fr-ch/gens/feed(.:format)"],
+        ["people_feed_de_ch", "GET", "/de-ch/leute/feed(.:format)"],
+        [nil, "GET", "/personnes/feed(.:format)"],
+        [nil, "GET", "/fr-ch/gens/feed(.:format)"],
+        [nil, "GET", "/de-ch/leute/feed(.:format)"]
+      ])
+    end
+
+    it "leaves the routes `resources` does not name unnamed, as Rails does" do
+      draw { localized { resources :people, only: [:index, :create, :show, :update] } }
+
+      french = route_set.routes.select { |route| route.defaults[:locale] == "fr-FR" }
+      expect(french.map { |route| [route.name, route.verb, route.path.spec.to_s] }).to eq([
+        ["people_fr_fr", "GET", "/personnes(.:format)"],
+        [nil, "POST", "/personnes(.:format)"],
+        ["person_fr_fr", "GET", "/personnes/:id(.:format)"],
+        [nil, "PATCH", "/personnes/:id(.:format)"],
+        [nil, "PUT", "/personnes/:id(.:format)"]
+      ])
+    end
   end
 
   describe "controller and action resolution" do
@@ -663,10 +775,14 @@ RSpec.describe ActionDispatch::I18nRouting::Patches::Mapper do
   end
 
   describe "`mount`" do
-    let(:mounted_helpers_context) do
-      Class.new.tap do |klass|
-        klass.include(route_set.url_helpers)
-        klass.include(route_set.mounted_helpers)
+    # Stands for a controller or a view of the app: +url_options+ are those of
+    # the current request.
+    def mounted_helpers_context(url_options = {})
+      routes = route_set
+      Class.new do
+        include routes.url_helpers
+        include routes.mounted_helpers
+        define_method(:url_options) { url_options }
       end.new
     end
 
@@ -763,12 +879,149 @@ RSpec.describe ActionDispatch::I18nRouting::Patches::Mapper do
         expect(body.to_a).to eq(["/journal"])
       end
 
+      it "makes the engine's own routes generate paths under the mount point of the current locale" do
+        mounted = engine
+        draw { localized { mount mounted, at: "blog" } }
+
+        paths = %i[fr-FR fr-CH de-CH].to_h do |locale|
+          [locale, I18n.with_locale(locale) { engine_routes.url_helpers.posts_path({}) }]
+        end
+        expect(paths).to eq("fr-FR": "/journal/posts", "fr-CH": "/fr-ch/blog/posts", "de-CH": "/de-ch/tagebuch/posts")
+      end
+
+      it "makes the engine's own routes fall back to the mount point of the default locale, then of the first configured locale" do
+        default_locale = I18n.default_locale
+        I18n.available_locales = [:en, :it, :"fr-FR", :"fr-CH", :"de-CH"]
+        mounted = engine
+        draw { localized { mount mounted, at: "blog" } }
+
+        expect(I18n.with_locale(:it) { engine_routes.url_helpers.posts_path({}) }).to eq("/journal/posts")
+
+        I18n.default_locale = :"de-CH"
+        expect(I18n.with_locale(:it) { engine_routes.url_helpers.posts_path({}) }).to eq("/de-ch/tagebuch/posts")
+      ensure
+        I18n.default_locale = default_locale
+      end
+
+      it "keeps the script name the engine's routes are given, as in a request to the engine" do
+        mounted = engine
+        draw { localized { mount mounted, at: "blog" } }
+
+        path = I18n.with_locale(:"fr-FR") { engine_routes.url_helpers.posts_path(script_name: "/de-ch/tagebuch") }
+        expect(path).to eq("/de-ch/tagebuch/posts")
+      end
+
+      it "makes the engine's own helpers use the mount point when called without arguments" do
+        # Without arguments, a named helper checks whether its last argument
+        # is an ActionController::Parameters, which this gem does not load.
+        stub_const("ActionController::Parameters", Class.new) unless defined?(ActionController::Parameters)
+        mounted = engine
+        draw { localized { mount mounted, at: "blog" } }
+
+        expect(I18n.with_locale(:"de-CH") { engine_routes.url_helpers.posts_path }).to eq("/de-ch/tagebuch/posts")
+      end
+
+      it "treats a blank script name as missing, as Rails does" do
+        mounted = engine
+        draw { localized { mount mounted, at: "blog" } }
+
+        path = I18n.with_locale(:"de-CH") { engine_routes.url_helpers.posts_path(script_name: "") }
+        expect(path).to eq("/de-ch/tagebuch/posts")
+      end
+
+      it "raises like Rails when the engine is mounted twice" do
+        mounted = engine
+
+        expect {
+          draw do
+            localized do
+              mount mounted, at: "a"
+              mount mounted, at: "b"
+            end
+          end
+        }.to raise_error(ArgumentError, /\AInvalid route name, already in use: 'i18n_mapper_spec_blog_fr_fr'/)
+      end
+
+      context "when mounted at the root path" do
+        # A mounted helper at "/" gives the engine's routes a blank script
+        # name: the request's one, "" in a controller or a view.
+        it "generates the engine's routes under the mount point of the mounted helper, whatever the current locale" do
+          mounted = engine
+          draw { localized { mount mounted, at: "/" } }
+          view = mounted_helpers_context(script_name: "")
+
+          paths = I18n.with_locale(:"de-CH") do
+            [
+              view.i18n_mapper_spec_blog_fr_fr.posts_path({}),
+              view.i18n_mapper_spec_blog_fr_ch.posts_url(host: "example.ch"),
+              view.i18n_mapper_spec_blog_de_ch.posts_path({})
+            ]
+          end
+          expect(paths).to eq(["/posts", "http://example.ch/fr-ch/posts", "/de-ch/posts"])
+        end
+
+        it "still makes the engine's own routes generate paths under the mount point of the current locale" do
+          mounted = engine
+          draw { localized { mount mounted, at: "/" } }
+
+          paths = %i[fr-FR fr-CH].map { |locale| I18n.with_locale(locale) { engine_routes.url_helpers.posts_path({}) } }
+          expect(paths).to eq(["/posts", "/fr-ch/posts"])
+        end
+      end
+
+      context "when mounted under a dynamic segment" do
+        it "makes the engine's own routes take the segment from their options, not into the query string" do
+          mounted = engine
+          draw { localized { mount mounted, at: ":account/blog" } }
+
+          path = I18n.with_locale(:"de-CH") { engine_routes.url_helpers.posts_path(account: "acme") }
+          expect(path).to eq("/de-ch/acme/tagebuch/posts")
+        end
+
+        it "makes the mounted helpers take the segment from the request's path parameters" do
+          mounted = engine
+          draw { localized { mount mounted, at: ":account/blog" } }
+          view = mounted_helpers_context(_recall: {account: "acme"})
+
+          expect(view.i18n_mapper_spec_blog_de_ch.posts_path({})).to eq("/de-ch/acme/tagebuch/posts")
+          expect(view.i18n_mapper_spec_blog_fr_fr.posts_path({})).to eq("/acme/journal/posts")
+        end
+      end
+
+      context "when the app has a relative URL root" do
+        let(:route_set) do
+          ActionDispatch::Routing::RouteSet.new_with_config(ActionDispatch::Routing::RouteSet::Config.new("/sub", false))
+        end
+
+        it "makes the mounted helpers prefix the engine's routes with it once" do
+          mounted = engine
+          draw { localized { mount mounted, at: "blog" } }
+          # As in a request to an engine of the app.
+          view = mounted_helpers_context(original_script_name: "/sub")
+
+          expect(view.i18n_mapper_spec_blog_de_ch.posts_path({})).to eq("/sub/de-ch/tagebuch/posts")
+        end
+      end
+
+      context "when no host is configured" do
+        before { ActionDispatch::I18nRouting.config.available_locales_per_host = {} }
+
+        it "mounts nothing and leaves the engine's own routes without a mount point" do
+          mounted = engine
+          draw { localized { mount mounted, at: "blog" } }
+
+          expect(route_set.routes).to be_empty
+          expect(engine_routes.url_helpers.posts_path({})).to eq("/posts")
+        end
+      end
+
       it "defines the regular, unsuffixed mounted helper when mounted outside `localized`" do
         mounted = engine
         draw { mount mounted, at: "blog" }
 
         expect(named_paths).to eq("i18n_mapper_spec_blog" => "/blog")
         expect(mounted_helpers_context.i18n_mapper_spec_blog.posts_path({})).to eq("/blog/posts")
+        expect(engine_routes.url_helpers.posts_path({})).to eq("/blog/posts")
         expect(route_set.mounted_helpers.method_defined?(:i18n_mapper_spec_blog_fr_fr)).to be(false)
       end
     end
