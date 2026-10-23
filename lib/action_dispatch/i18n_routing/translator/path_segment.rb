@@ -7,20 +7,17 @@ module ActionDispatch
         class << self
           private
 
-          def translatable_segment(segment)
-            matches = ActionDispatch::I18nRouting::TRANSLATABLE_SEGMENT.match(segment)
-            matches[1] if matches.present?
-          end
-
+          # Returns the translation of +str+ in +scope+, falling back to the
+          # :routes scope, or +str+ itself when neither has one. Only a String
+          # counts as a translation: a key naming a subtree of translations
+          # (e.g. "controllers") returns a Hash, which is treated as missing.
           def translate_resource(str, locale, scope)
-            handler = proc { |exception| exception }
-            opts = {locale: locale, scope: scope}
-
-            if I18n.t(str, **opts.merge(exception_handler: handler)).is_a?(I18n::MissingTranslation)
-              I18n.t!(str, **opts.merge(scope: :routes, default: str))
-            else
-              I18n.t(str, **opts)
+            [scope, :routes].each do |lookup_scope|
+              translation = I18n.t(str, locale: locale, scope: lookup_scope, default: nil)
+              return translation if translation.is_a?(String)
             end
+
+            str
           end
 
           def translate_string(str, locale, scope)
@@ -34,11 +31,15 @@ module ActionDispatch
 
         # Translates a single path segment.
         #
-        # If the path segment contains something like an optional format
-        # "people(.:format)", only "people" will be translated.
-        # If the path contains a hyphenated suffix, it will be translated.
-        # If there is no translation, the path segment is blank, begins with a
-        # ":" (param key) or "*" (wildcard), the segment is returned untouched.
+        # Only the word the segment starts with (letters, digits, "-" and "_",
+        # see TRANSLATABLE_SEGMENT) is translated; every other character is
+        # kept verbatim: "page(s)" gives "fiche(s)", "people(" gives "gens(".
+        # A named param followed by a hyphenated suffix (":id-slug") keeps the
+        # param and translates the suffix.
+        # The segment is returned untouched when it has no translation, is
+        # blank, does not start with such a word ("%C3%BCber", "~me"), begins
+        # with "(" (optional group) or "*" (wildcard), or contains a ":" (param
+        # key). The argument is never modified, so it may be frozen.
         def translate(segment, locale, scope)
           return segment if segment.empty?
 
@@ -49,10 +50,11 @@ module ActionDispatch
 
           return segment if segment.start_with?("(", "*") || segment.include?(":")
 
-          appended_part = segment.slice!(/(\()$/)
-          str = translatable_segment(segment)
+          matches = ActionDispatch::I18nRouting::TRANSLATABLE_SEGMENT.match(segment)
+          return segment if matches.nil?
 
-          (translate_string(str, locale, scope) || segment) + appended_part.to_s
+          translation = translate_string(matches[1], locale, scope)
+          "#{matches.pre_match}#{translation}#{segment[matches.end(1)..]}"
         end
       end
     end

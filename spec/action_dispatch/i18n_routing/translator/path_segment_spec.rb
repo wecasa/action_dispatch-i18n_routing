@@ -2,11 +2,10 @@
 
 RSpec.describe ActionDispatch::I18nRouting::Translator::PathSegment do
   describe ".translate" do
-    # NOTE: .translate strips a trailing "(" from its argument in place
-    # (String#slice!), so it needs a mutable String. Every example below goes
-    # through #translate, which hands it an unfrozen copy.
+    # The string literals below are frozen (magic comment): .translate must
+    # never modify its argument.
     def translate(segment, locale = :fr, scope = people_scope)
-      described_class.translate(segment.dup, locale, scope)
+      described_class.translate(segment, locale, scope)
     end
 
     let(:people_scope) { [:routes, :controllers, "people"] }
@@ -29,8 +28,11 @@ RSpec.describe ActionDispatch::I18nRouting::Translator::PathSegment do
           archive: "archives",
           foo: "truc",
           team: "l'équipe",
+          page: "fiche",
+          profile: "profil",
+          tags: %w[a b],
           controllers: {
-            people: {people: "gens", new: "nouveau"},
+            people: {people: "gens", new: "nouveau", profile: {edit: "modifier"}},
             "admin/people": {people: "membres"}
           }
         }
@@ -115,7 +117,12 @@ RSpec.describe ActionDispatch::I18nRouting::Translator::PathSegment do
         "(.:format)" => "an optional format",
         "(archive" => "an optional group start",
         "foo:bar" => "a segment containing a param",
-        ":format)" => "a param closing an optional group"
+        ":format)" => "a param closing an optional group",
+        "%C3%BCber" => "a segment starting with a percent-encoded character",
+        "~me" => "a segment starting with a tilde",
+        "@me" => "a segment starting with an at sign",
+        "+1" => "a segment starting with a plus sign",
+        "~people" => "a translatable word that does not start the segment"
       }.each do |segment, description|
         it "leaves #{description} (#{segment.inspect}) untouched" do
           expect(translate(segment)).to eq(segment)
@@ -144,6 +151,10 @@ RSpec.describe ActionDispatch::I18nRouting::Translator::PathSegment do
         expect(translate(":id-slug(")).to eq(":id-titre(")
       end
 
+      it "keeps the characters following the translated suffix" do
+        expect(translate(":id-page(s)")).to eq(":id-fiche(s)")
+      end
+
       it "leaves a second param in the suffix untouched" do
         expect(translate(":id-:slug")).to eq(":id-:slug")
       end
@@ -168,6 +179,66 @@ RSpec.describe ActionDispatch::I18nRouting::Translator::PathSegment do
 
       it "is kept after a hyphenated word" do
         expect(translate("my-page_2(")).to eq("ma-page(")
+      end
+    end
+
+    # Only the leading word is looked up (same key as TRANSLATABLE_SEGMENT
+    # captures); whatever follows it is part of the route path, already
+    # escaped by Rails, and must survive.
+    describe "characters following the word" do
+      {
+        "page(s)" => "fiche(s)",
+        "archive)" => "archives)",
+        "people~me" => "gens~me",
+        "people%C3%A9" => "gens%C3%A9"
+      }.each do |segment, expected|
+        it "are kept verbatim after a translated word (#{segment.inspect})" do
+          expect(translate(segment)).to eq(expected)
+        end
+      end
+
+      %w[caf%C3%A9 c++ sign~up unknown) unknown(s)].each do |segment|
+        it "are kept verbatim after an untranslated word (#{segment.inspect})" do
+          expect(translate(segment)).to eq(segment)
+        end
+      end
+    end
+
+    describe "lookups that do not return a String" do
+      it "fall back to the :routes scope when the controller-scoped key names a subtree" do
+        expect(translate("profile")).to eq("profil")
+      end
+
+      # A route without a controller (redirect, Rack app) gives the scope
+      # [:routes, :controllers, nil], so "people" names routes.controllers.people.
+      it "fall back to the :routes scope when the scope has no controller" do
+        expect(translate("people", :fr, [:routes, :controllers, nil])).to eq("personnes")
+      end
+
+      it "leave a segment naming a subtree in the :routes scope untouched" do
+        expect([translate("controllers"), translate("controllers", :fr, :routes)])
+          .to eq(%w[controllers controllers])
+      end
+
+      it "leave a segment whose translation is not a String untouched" do
+        expect(translate("tags")).to eq("tags")
+      end
+    end
+
+    describe "the segment argument" do
+      it "is not modified" do
+        segment = +"people("
+
+        described_class.translate(segment, :fr, people_scope)
+
+        expect(segment).to eq("people(")
+      end
+
+      it "may be frozen" do
+        segment = "people("
+
+        expect(segment).to be_frozen
+        expect(described_class.translate(segment, :fr, people_scope)).to eq("gens(")
       end
     end
 
