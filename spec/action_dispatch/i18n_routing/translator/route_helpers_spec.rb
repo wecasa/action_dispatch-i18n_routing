@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "abstract_controller"
+
 RSpec.describe ActionDispatch::I18nRouting::Translator::RouteHelpers do
   let(:route_set) { ActionDispatch::Routing::RouteSet.new }
   let(:named_routes) { route_set.named_routes }
@@ -113,6 +115,72 @@ RSpec.describe ActionDispatch::I18nRouting::Translator::RouteHelpers do
       I18n.with_locale(:"de-CH") do
         expect(helpers.people_path).to eq("/de-ch/leute")
         expect(helpers.people_url).to eq("http://www.example.test/de-ch/leute")
+      end
+    end
+
+    it "lists the helpers only once in helper_names when called twice for the same name" do
+      2.times { described_class.add(:people, named_routes) }
+
+      expect(named_routes.helper_names.tally.values_at("people_path", "people_url")).to eq([1, 1])
+    end
+
+    # The collection tracks its helpers to answer helper_names (subtracted
+    # from controller action methods), route_defined? and to remove them on
+    # clear! (when the routes are redrawn): the generic helpers must be part
+    # of it like any named route helper.
+    context "when registering the helpers in the named route collection" do
+      before { described_class.add(:people, named_routes) }
+
+      it "lists <name>_path and <name>_url in helper_names" do
+        expect(named_routes.helper_names).to include("people_path", "people_url")
+      end
+
+      it "reports <name>_path and <name>_url as defined by route_defined?" do
+        expect(named_routes.route_defined?(:people_path)).to be(true)
+        expect(named_routes.route_defined?(:people_url)).to be(true)
+      end
+
+      it "keeps <name>_path and <name>_url out of a controller's action methods" do
+        routes = route_set
+        # Like ApplicationController: an abstract base class whose public
+        # methods (url_for, ...) are not actions, bound to the route set.
+        base_controller_class = Class.new(AbstractController::Base) do
+          abstract!
+          include AbstractController::UrlFor
+        end
+        base_controller_class.define_singleton_method(:_routes) { routes }
+        controller_class = Class.new(base_controller_class) do
+          include routes.url_helpers
+
+          def index
+          end
+        end
+
+        expect(controller_class.action_methods.to_a).to eq(["index"])
+      end
+
+      it "removes <name>_path and <name>_url when the collection is cleared" do
+        named_routes.clear!
+
+        expect(named_routes.path_helpers_module.method_defined?(:people_path)).to be(false)
+        expect(named_routes.url_helpers_module.method_defined?(:people_url)).to be(false)
+        expect(named_routes.helper_names).to be_empty
+      end
+    end
+
+    # A localized route drawn without a name (no as:, as: nil, as: false)
+    # has no generic helper: no junk "_path" or "false_path" method.
+    [nil, "", false].each do |name|
+      it "defines no helper when the route name is #{name.inspect}" do
+        defined_helpers = lambda do
+          [
+            named_routes.path_helpers_module.instance_methods.sort,
+            named_routes.url_helpers_module.instance_methods.sort,
+            named_routes.helper_names.sort
+          ]
+        end
+
+        expect { described_class.add(name, named_routes) }.not_to change(&defined_helpers)
       end
     end
   end
@@ -286,6 +354,27 @@ RSpec.describe ActionDispatch::I18nRouting::Translator::RouteHelpers do
         expect(helpers.people_url(locale: "fr-CH")).to eq("http://x.ch/fr-ch/gens")
       end
     end
+
+    it "lists the dispatching helpers among the route set's helper names" do
+      expect(named_routes.helper_names).to include("people_path", "people_url")
+    end
+
+    it "removes the dispatching helpers when the routes are redrawn without the localized route" do
+      route_set.draw { get "other", to: "other#index", as: :other }
+
+      expect(helpers).not_to respond_to(:people_path)
+      expect(helpers).not_to respond_to(:people_url)
+      expect(named_routes.route_defined?(:people_path)).to be(false)
+    end
+
+    it "defines the dispatching helpers again when the localized route is redrawn" do
+      route_set.draw do
+        localized { get "people", to: "people#index", as: :people }
+      end
+
+      expect(I18n.with_locale(:"de-CH") { helpers.people_path }).to eq("/de-ch/leute")
+      expect(named_routes.helper_names.tally.values_at("people_path", "people_url")).to eq([1, 1])
+    end
   end
 
   context "when localized routes are drawn for a locale made of several subtags" do
@@ -341,6 +430,12 @@ RSpec.describe ActionDispatch::I18nRouting::Translator::RouteHelpers do
         described_class.add(:people, named_routes)
 
         expect(helpers).to respond_to(:people_path, :people_url)
+      end
+
+      it "does not register any test case hook for an unnamed route" do
+        described_class.add(nil, named_routes)
+
+        expect(ActiveSupport).not_to have_received(:on_load)
       end
     end
 
